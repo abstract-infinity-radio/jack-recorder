@@ -15,6 +15,7 @@ enum Command {
     /// Record audio
     Record {
         /// List of inputs to ignore when recording
+        #[clap(short)]
         inputs: Vec<String>
     },
 
@@ -27,16 +28,8 @@ fn main() {
 
     match cli.command {
         Command::Record { inputs } => {
-            record(inputs);
+            recorder::record(inputs);
         },
         Command::List => recorder::listports()
-    }
-}
-
-fn record(inputs: Vec<String>) {
-    println!("Recording the following inputs:");
-
-    for input in &inputs {
-        println!("\t {}", input)
     }
 }
