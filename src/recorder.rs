@@ -1,10 +1,37 @@
+use chrono::{Datelike, Timelike, Utc};
+use crossbeam_channel::{unbounded, RecvTimeoutError};
 use jack;
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
 const JACK_CLIENT_NAME: &str = "Art Infinity Radio";
+
+#[derive(Debug)]
+struct RecordingPortContainer {
+    src_port_name: std::string::String,
+    dst_port_name: std::string::String,
+    port: jack::Port<jack::AudioIn>,
+}
+
+#[derive(Debug)]
+struct SampleContainer {
+    src_port_name: String,
+    samples: Vec<f32>,
+}
+
+impl SampleContainer {
+    pub fn new(port_name: &str, data: &[f32]) -> Self {
+        SampleContainer {
+            src_port_name: String::from(port_name),
+            samples: Vec::from(data),
+        }
+    }
+}
 
 pub fn listports() {
     // connect to JACK
@@ -24,9 +51,10 @@ pub fn listports() {
     }
 }
 
-pub fn record(ignored_inputs: Vec<String>) {
+pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
     let mut ports_to_record: Vec<String> = Vec::new();
 
+    // create JACK client
     let client = match jack::Client::new(JACK_CLIENT_NAME, jack::ClientOptions::NO_START_SERVER) {
         Ok((client, _status)) => client,
         Err(err) => {
@@ -44,34 +72,48 @@ pub fn record(ignored_inputs: Vec<String>) {
         ports_to_record.push(val.clone());
     }
 
-    println!("Recording the following inputs:");
-    for port_name in &ports_to_record {
-        println!("\t{}", port_name)
-    }
-
     if ports_to_record.len() == 0 {
         eprintln!("No ports to record!");
         return;
     }
 
-    println!("Press CTRL-C to stop recording...");
+    if verbose {
+        println!("Recording the following inputs:");
+        for port_name in &ports_to_record {
+            println!("\t{}", port_name)
+        }
+    }
 
     // setup CTRL-C handler
-    let should_stop_flag = Arc::new(AtomicBool::new(false));
-    let should_stop = should_stop_flag.clone();
-    ctrlc::set_handler(move || {
-        println!("CTRL-C detected!");
-        should_stop_flag.store(true, Ordering::SeqCst);
-    })
-    .expect("Error setting Ctrl-C handler");
+    println!("Press CTRL-C to stop recording...");
+    let should_stop = Arc::new(AtomicBool::new(false));
+    {
+        let should_stop = should_stop.clone();
+        ctrlc::set_handler(move || {
+            println!("CTRL-C detected!");
+            should_stop.store(true, Ordering::SeqCst);
+        })
+        .expect("Error setting Ctrl-C handler");
+    }
 
-    // setup recording
-    let mut recording_port_tuples: Vec<(&str, jack::Port<jack::AudioIn>)> = Vec::new();
+    // setup recording ports
+    let wawfile_specification = hound::WavSpec {
+        channels: 1,
+        sample_rate: client.sample_rate() as u32,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+
+    let mut recording_ports: Vec<RecordingPortContainer> = Vec::new();
     for port_name in &ports_to_record {
-        match record_port(port_name, &client) {
-            Ok(port) => {
-                let port_name_copy = string_to_static_str(String::from(port_name));
-                recording_port_tuples.push((port_name_copy, port));
+        match setup_recording_port(port_name, &client) {
+            Ok((recording_port_name, port)) => {
+                let r = RecordingPortContainer {
+                    src_port_name: String::from(port_name),
+                    dst_port_name: String::from(recording_port_name),
+                    port: port,
+                };
+                recording_ports.push(r);
             }
             Err(e) => {
                 eprintln!("Could not create recording port for {}: {}", port_name, e);
@@ -80,59 +122,172 @@ pub fn record(ignored_inputs: Vec<String>) {
         }
     }
 
-    // connect input ports to recording ports
-    let should_stop_cb =should_stop.clone();
-    let process_callback = move |_: &jack::Client, ps: &jack::ProcessScope| {
-        println!("Processing {} frames", ps.n_frames());
-        if should_stop_cb.load(Ordering::Relaxed) {
-            // receiving callbacks after call to `client.deactivate()`
-            // causes panics in rust lib so this effectively stops this processing
-            return jack::Control::Quit;
+    // copy of ports vector to be shared around (shadowed variable)
+    let recording_ports: Arc<Vec<RecordingPortContainer>> = Arc::from(recording_ports);
+
+    // setup cross-thread communication with crossbeam
+    let (tx, rx) = unbounded::<SampleContainer>();
+
+    let write_thread;
+    {
+        let recording_ports = recording_ports.clone();
+        let should_stop = should_stop.clone();
+        let output_dir = String::from(output_dir);
+        write_thread = std::thread::spawn(move || {
+            let now = Utc::now();
+            let timestamp = format!(
+                "{:04}-{:02}-{:02}-{:02}-{:02}-{:02}",
+                now.year(),
+                now.month(),
+                now.day(),
+                now.hour(),
+                now.minute(),
+                now.second()
+            );
+            // setup wav files dictionary
+            let mut port_files = HashMap::new();
+            for i in 0..recording_ports.len() {
+                let rec_info = &recording_ports[i];
+                let filename = Path::new(&output_dir)
+                    .join(Path::new(&format!(
+                        "{}-{}-{}.wav",
+                        timestamp,
+                        i,
+                        rec_info
+                            .src_port_name
+                            .replace(crate::util::is_unsafe_char, "_")
+                    )))
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                port_files.insert(
+                    rec_info.src_port_name.clone(),
+                    hound::WavWriter::create(filename, wawfile_specification).unwrap(),
+                );
+            }
+
+            let mut counter = 0;
+            loop {
+                match rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(_data) => {
+                        match port_files.get_mut(&_data.src_port_name) {
+                            Some(w) => {
+                                for sample in _data.samples {
+                                    w.write_sample(sample).unwrap();
+                                }
+                            }
+                            None => eprintln!("Writer not present!?!"),
+                        };
+                    }
+                    Err(e) => {
+                        if e != RecvTimeoutError::Timeout {
+                            eprintln!("{}", e)
+                        }
+                    }
+                };
+                if counter == 0 && verbose {
+                    println!("Write queue length: {}", rx.len());
+                }
+                if should_stop.load(Ordering::Relaxed) {
+                    if rx.len() == 0 {
+                        break;
+                    }
+                    println!("Writing data to disk...");
+                }
+
+                counter = (counter + 1) % 1000;
+            }
+
+            // finalize each WAV writer
+            for (key, entry) in port_files.drain() {
+                match entry.finalize() {
+                    Ok(_) => println!("Finalized wirting {}", key),
+                    Err(e) => println!("Error when finalizing WAV file for port {}: {}", key, e),
+                }
+            }
+            println!("Writer thread finished!");
+        });
+    }
+
+    // setup JACK process callback
+    let should_stop_cb = should_stop.clone();
+    let process_callback = {
+        let recording_ports = recording_ports.clone();
+        move |_: &jack::Client, ps: &jack::ProcessScope| {
+            if should_stop_cb.load(Ordering::Relaxed) {
+                // receiving callbacks after call to `client.deactivate()`
+                // causes panics in rust lib so this effectively stops this processing
+                return jack::Control::Quit;
+            }
+            for i in 0..recording_ports.len() {
+                let rec_info = &recording_ports[i];
+                let input_slice = rec_info.port.as_slice(ps);
+
+                let data = SampleContainer::new(&rec_info.src_port_name, input_slice);
+                match tx.send(data) {
+                    Ok(_) => (),
+                    Err(e) => eprintln!("Error sending data to write thread: {}", e),
+                };
+            }
+            return jack::Control::Continue;
         }
-        for _ in &recording_port_tuples {}
-        return jack::Control::Continue;
     };
     let process_loop = jack::ClosureProcessHandler::new(process_callback);
+    // activate JACK client (starts async processing loop)
     let client = match client.activate_async((), process_loop) {
         Ok(client) => client,
         Err(e) => panic!("Could not activate JACK client! {}", e),
     };
 
-    // wait until it is finished
+    // connect input ports to recording ports
+    for i in 0..recording_ports.len() {
+        let rec_info = &recording_ports[i];
+        println!(
+            "Connecting port {} to {}",
+            rec_info.src_port_name, rec_info.src_port_name
+        );
+        match client.as_client().connect_ports_by_name(
+            rec_info.src_port_name.as_ref(),
+            rec_info.dst_port_name.as_ref(),
+        ) {
+            Ok(_) => (),
+            Err(e) => eprintln!(
+                "Could not connect ports {} - {}: {}",
+                rec_info.src_port_name, rec_info.dst_port_name, e
+            ),
+        }
+    }
+
+    // wait until Ctrl-C is detected
     while !should_stop.load(Ordering::Relaxed) {
         sleep(Duration::from_millis(100));
     }
-    
-    sleep(Duration::from_millis(100));
-    // drop(client);
+    // wait a little with the deactivation in order to avoid
+    // a bug in JACK
+    sleep(Duration::from_millis(500));
+
     match client.deactivate() {
         Ok(_) => (),
         Err(e) => eprintln!("Error while deactivating JACK client: {}", e),
     }
-    // println!("Deactivated");
-    // sleep in order to let the JACK cleanup resources...
-    // TODO: wait for wav recording to stop.
+    println!("Waiting for write thread to finish...");
+    match write_thread.join() {
+        Ok(_) => (),
+        Err(_) => eprintln!("Error while waiting for thread to finish"),
+    };
+
+    println!("Finished recording");
 }
 
-fn record_port(
+fn setup_recording_port(
     port_name: &str,
     jack_client: &jack::Client,
-) -> Result<jack::Port<jack::AudioIn>, jack::Error> {
+) -> Result<(String, jack::Port<jack::AudioIn>), jack::Error> {
     println!("Recoding port... {}", port_name);
 
-    let port_prefix = "jack_recorder:";
-    let recording_port_name = format!("{}{}", port_prefix, port_name);
-
     // create a recording port
-    match jack_client.register_port(&recording_port_name, jack::AudioIn::default()) {
-        Ok(port) => Ok(port),
+    match jack_client.register_port(&port_name, jack::AudioIn::default()) {
+        Ok(port) => Ok((format!("{}:{}", JACK_CLIENT_NAME, port_name), port)),
         Err(e) => Err(e),
     }
-
-    // connect capture port with recording port created above
-}
-
-// This is required in order to provide a list of port names to JACK callback
-fn string_to_static_str(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
 }
