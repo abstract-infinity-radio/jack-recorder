@@ -155,7 +155,7 @@ pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
                         i,
                         rec_info
                             .src_port_name
-                            .replace(crate::util::is_unsafe_char, "_")
+                            .replace(is_unsafe_char, "_")
                     )))
                     .to_str()
                     .unwrap()
@@ -290,4 +290,11 @@ fn setup_recording_port(
         Ok(port) => Ok((format!("{}:{}", JACK_CLIENT_NAME, port_name), port)),
         Err(e) => Err(e),
     }
+}
+
+fn is_unsafe_char(x: char) -> bool {
+    if (x >= 'a' && x <= 'z') || (x >= 'A' && x <= 'Z') || (x >= '0' && x <= '9') {
+        return false;
+    }
+    return true;
 }

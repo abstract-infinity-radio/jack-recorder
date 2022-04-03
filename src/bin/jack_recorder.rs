@@ -1,9 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::path::Path;
 
-mod recorder;
-mod util;
-
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Cli {
@@ -43,8 +40,8 @@ fn main() {
                 return;
             }
 
-            recorder::record(&output_dir, inputs, cli.verbose);
+            jack_recorder::record(&output_dir, inputs, cli.verbose);
         },
-        Command::List => recorder::listports()
+        Command::List => jack_recorder::listports()
     }
 }
