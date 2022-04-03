@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
+use log::warn;
 use std::path::Path;
+use log::LevelFilter;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -9,7 +11,7 @@ struct Cli {
 
     /// verbose output
     #[clap(short)]
-    verbose: bool
+    verbose: bool,
 }
 
 // Available commands
@@ -31,17 +33,18 @@ enum Command {
 }
 
 fn main() {
+    simple_logging::log_to_stderr(LevelFilter::Debug);
     let cli = Cli::parse();
 
     match cli.command {
         Command::Record { output_dir, inputs } => {
             if !Path::new(&output_dir).exists() {
-                eprintln!("Output directory {} does not exist!", output_dir);
+                warn!("Output directory {} does not exist!", output_dir);
                 return;
             }
 
             jack_recorder::record(&output_dir, inputs, cli.verbose);
-        },
-        Command::List => jack_recorder::listports()
+        }
+        Command::List => jack_recorder::listports(),
     }
 }

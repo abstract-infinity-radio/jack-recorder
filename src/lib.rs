@@ -1,6 +1,7 @@
 use chrono::{Datelike, Timelike, Utc};
 use crossbeam_channel::{unbounded, RecvTimeoutError};
 use jack;
+use log::{info, warn};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::Path;
@@ -38,17 +39,18 @@ pub fn listports() {
     let client = match jack::Client::new(JACK_CLIENT_NAME, jack::ClientOptions::NO_START_SERVER) {
         Ok((client, _status)) => client,
         Err(err) => {
-            eprintln!("Jack server not running?! {}", err);
+            warn!("Jack server not running?! {}", err);
             std::process::exit(-1);
         }
     };
 
     // list output ports
     let port_list = client.ports(None, None, jack::PortFlags::IS_OUTPUT);
-    println!("Available ports to record from:");
+    info!("Available ports to record from:");
     for val in port_list.iter() {
-        println!("{}", val);
+        info!("{}", val);
     }
+    drop(client);
 }
 
 pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
@@ -58,7 +60,7 @@ pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
     let client = match jack::Client::new(JACK_CLIENT_NAME, jack::ClientOptions::NO_START_SERVER) {
         Ok((client, _status)) => client,
         Err(err) => {
-            eprintln!("Jack server not running?! {}", err);
+            warn!("Jack server not running?! {}", err);
             std::process::exit(-1);
         }
     };
@@ -73,24 +75,24 @@ pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
     }
 
     if ports_to_record.len() == 0 {
-        eprintln!("No ports to record!");
+        warn!("No ports to record!");
         return;
     }
 
     if verbose {
-        println!("Recording the following inputs:");
+        info!("Recording the following inputs:");
         for port_name in &ports_to_record {
-            println!("\t{}", port_name)
+            info!("\t{}", port_name)
         }
     }
 
     // setup CTRL-C handler
-    println!("Press CTRL-C to stop recording...");
+    info!("Press CTRL-C to stop recording...");
     let should_stop = Arc::new(AtomicBool::new(false));
     {
         let should_stop = should_stop.clone();
         ctrlc::set_handler(move || {
-            println!("CTRL-C detected!");
+            info!("CTRL-C detected!");
             should_stop.store(true, Ordering::SeqCst);
         })
         .expect("Error setting Ctrl-C handler");
@@ -116,7 +118,7 @@ pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
                 recording_ports.push(r);
             }
             Err(e) => {
-                eprintln!("Could not create recording port for {}: {}", port_name, e);
+                warn!("Could not create recording port for {}: {}", port_name, e);
                 continue;
             }
         }
@@ -153,9 +155,7 @@ pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
                         "{}-{}-{}.wav",
                         timestamp,
                         i,
-                        rec_info
-                            .src_port_name
-                            .replace(is_unsafe_char, "_")
+                        rec_info.src_port_name.replace(is_unsafe_char, "_")
                     )))
                     .to_str()
                     .unwrap()
@@ -176,23 +176,23 @@ pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
                                     w.write_sample(sample).unwrap();
                                 }
                             }
-                            None => eprintln!("Writer not present!?!"),
+                            None => warn!("Writer not present!?!"),
                         };
                     }
                     Err(e) => {
                         if e != RecvTimeoutError::Timeout {
-                            eprintln!("{}", e)
+                            warn!("{}", e)
                         }
                     }
                 };
                 if counter == 0 && verbose {
-                    println!("Write queue length: {}", rx.len());
+                    info!("Write queue length: {}", rx.len());
                 }
                 if should_stop.load(Ordering::Relaxed) {
                     if rx.len() == 0 {
                         break;
                     }
-                    println!("Writing data to disk...");
+                    info!("Writing data to disk...");
                 }
 
                 counter = (counter + 1) % 1000;
@@ -201,11 +201,11 @@ pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
             // finalize each WAV writer
             for (key, entry) in port_files.drain() {
                 match entry.finalize() {
-                    Ok(_) => println!("Finalized wirting {}", key),
-                    Err(e) => println!("Error when finalizing WAV file for port {}: {}", key, e),
+                    Ok(_) => info!("Finalized wirting {}", key),
+                    Err(e) => info!("Error when finalizing WAV file for port {}: {}", key, e),
                 }
             }
-            println!("Writer thread finished!");
+            info!("Writer thread finished!");
         });
     }
 
@@ -226,7 +226,7 @@ pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
                 let data = SampleContainer::new(&rec_info.src_port_name, input_slice);
                 match tx.send(data) {
                     Ok(_) => (),
-                    Err(e) => eprintln!("Error sending data to write thread: {}", e),
+                    Err(e) => warn!("Error sending data to write thread: {}", e),
                 };
             }
             return jack::Control::Continue;
@@ -242,7 +242,7 @@ pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
     // connect input ports to recording ports
     for i in 0..recording_ports.len() {
         let rec_info = &recording_ports[i];
-        println!(
+        info!(
             "Connecting port {} to {}",
             rec_info.src_port_name, rec_info.src_port_name
         );
@@ -251,7 +251,7 @@ pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
             rec_info.dst_port_name.as_ref(),
         ) {
             Ok(_) => (),
-            Err(e) => eprintln!(
+            Err(e) => warn!(
                 "Could not connect ports {} - {}: {}",
                 rec_info.src_port_name, rec_info.dst_port_name, e
             ),
@@ -268,22 +268,22 @@ pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
 
     match client.deactivate() {
         Ok(_) => (),
-        Err(e) => eprintln!("Error while deactivating JACK client: {}", e),
+        Err(e) => warn!("Error while deactivating JACK client: {}", e),
     }
-    println!("Waiting for write thread to finish...");
+    info!("Waiting for write thread to finish...");
     match write_thread.join() {
         Ok(_) => (),
-        Err(_) => eprintln!("Error while waiting for thread to finish"),
+        Err(_) => warn!("Error while waiting for thread to finish"),
     };
 
-    println!("Finished recording");
+    info!("Finished recording");
 }
 
 fn setup_recording_port(
     port_name: &str,
     jack_client: &jack::Client,
 ) -> Result<(String, jack::Port<jack::AudioIn>), jack::Error> {
-    println!("Recoding port... {}", port_name);
+    info!("Recoding port... {}", port_name);
 
     // create a recording port
     match jack_client.register_port(&port_name, jack::AudioIn::default()) {
