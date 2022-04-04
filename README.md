@@ -1,7 +1,14 @@
 # Building
 
-* `cargo build` for local build
-* for cross-compiling to linux:
-    * build a docker image: `docker build -t jack_recorder_build_image .`
-    * build a binary: `docker run --rm -ti -v $(pwd):/work jack_recorder_build_image bash -c 'cd /work ; cargo build'`
-    * optionally copy to server: `scp target-linux/debug/jack_recorder kohai.ijs.si:/opt/jack_recorder`
+* for local build: `cargo build`
+* for cross-compiling:
+    * build an appropriate image with `docker build -t rustembedded/cross:withjack-0.2.1 .`
+    * initiate a cross platform build with `cross build --target x86_64-unknown-linux-gnu`
+* more info: https://github.com/cross-rs/cross
+* optionally copy to server: `scp target/x86_64-unknown-linux-gnu/debug/jack_recorder kohai.ijs.si:/opt/jack_recorder`
+
+# Running
+
+* `jack_recorder listports` to list the available ports
+* `jack_recorder record -o /path/to/output/directory` to record all avaialable inputs and store recordings in the output directory
+* use `-v` flag to output recording queue length periodically
