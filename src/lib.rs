@@ -1,7 +1,8 @@
+use std::fs::create_dir_all;
 use chrono::{Datelike, Timelike, Utc};
 use crossbeam_channel::{unbounded, RecvTimeoutError};
 use jack;
-use log::{info, warn};
+use log::{info, warn, error};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::Path;
@@ -34,26 +35,28 @@ impl SampleContainer {
     }
 }
 
-pub fn listports() {
+pub fn listports() -> Result<Vec<String>, String> {
     // connect to JACK
     let client = match jack::Client::new(JACK_CLIENT_NAME, jack::ClientOptions::NO_START_SERVER) {
         Ok((client, _status)) => client,
         Err(err) => {
-            warn!("Jack server not running?! {}", err);
-            std::process::exit(-1);
+            let msg = format!("Jack server not running?! {}", err);
+            warn!("{}", msg);
+            return Err(msg);
         }
     };
 
     // list output ports
+    let mut ports: Vec<String> = vec![];
     let port_list = client.ports(None, None, jack::PortFlags::IS_OUTPUT);
     info!("Available ports to record from:");
     for val in port_list.iter() {
-        info!("{}", val);
+        ports.push(format!("{}", val));
     }
-    drop(client);
+    Ok(ports)
 }
 
-pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
+pub fn record(output_dir: &String, port_selection: Vec<String>, verbose: bool, should_stop: Arc<AtomicBool>) {
     let mut ports_to_record: Vec<String> = Vec::new();
 
     // create JACK client
@@ -68,15 +71,9 @@ pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
     // get the list of output ports to record from
     let port_list = client.ports(None, None, jack::PortFlags::IS_OUTPUT);
     for val in port_list.iter() {
-        if ignored_inputs.contains(val) {
-            continue;
+        if port_selection.len() == 0 || port_selection.contains(val) {
+            ports_to_record.push(val.clone());
         }
-        ports_to_record.push(val.clone());
-    }
-
-    if ports_to_record.len() == 0 {
-        warn!("No ports to record!");
-        return;
     }
 
     if verbose {
@@ -86,16 +83,9 @@ pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
         }
     }
 
-    // setup CTRL-C handler
-    info!("Press CTRL-C to stop recording...");
-    let should_stop = Arc::new(AtomicBool::new(false));
-    {
-        let should_stop = should_stop.clone();
-        ctrlc::set_handler(move || {
-            info!("CTRL-C detected!");
-            should_stop.store(true, Ordering::SeqCst);
-        })
-        .expect("Error setting Ctrl-C handler");
+    if ports_to_record.len() == 0 {
+        warn!("No ports to record!");
+        return;
     }
 
     // setup recording ports
@@ -146,6 +136,15 @@ pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
                 now.minute(),
                 now.second()
             );
+            // create timestamp directory for each recording "session"
+            let output_dir = Path::new(&output_dir).join(Path::new(&timestamp));
+            match create_dir_all(&output_dir) {
+                Ok(ok) => ok,
+                Err(e) => {
+                    error!("Could not create target directory {:?} - {}", output_dir, e);
+                    return;
+                }
+            };
             // setup wav files dictionary
             let mut port_files = HashMap::new();
             for i in 0..recording_ports.len() {
@@ -201,7 +200,7 @@ pub fn record(output_dir: &String, ignored_inputs: Vec<String>, verbose: bool) {
             // finalize each WAV writer
             for (key, entry) in port_files.drain() {
                 match entry.finalize() {
-                    Ok(_) => info!("Finalized wirting {}", key),
+                    Ok(_) => info!("Finalized writing {}", key),
                     Err(e) => info!("Error when finalizing WAV file for port {}: {}", key, e),
                 }
             }
@@ -283,7 +282,7 @@ fn setup_recording_port(
     port_name: &str,
     jack_client: &jack::Client,
 ) -> Result<(String, jack::Port<jack::AudioIn>), jack::Error> {
-    info!("Recoding port... {}", port_name);
+    info!("Recording port... {}", port_name);
 
     // create a recording port
     match jack_client.register_port(&port_name, jack::AudioIn::default()) {

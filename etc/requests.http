@@ -1,0 +1,23 @@
+@host = http://localhost:8000
+
+GET {{ host }}/list
+
+###
+
+GET {{ host }}/status
+
+###
+
+POST {{ host }}/start_recording
+Content-Type: application/json
+
+{
+    "ports": [
+        "system:capture_1",
+        "system:capture_2"
+    ]
+}
+
+###
+
+POST {{ host }}/stop_recording 
