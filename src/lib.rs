@@ -1,15 +1,20 @@
-use std::fs::create_dir_all;
 use chrono::{Datelike, Timelike, Utc};
 use crossbeam_channel::{unbounded, RecvTimeoutError};
 use jack;
-use log::{info, warn, error};
+use log::{error, info, warn};
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::fs;
+use std::fs::create_dir_all;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
+use zip::write::FileOptions;
 
 const JACK_CLIENT_NAME: &str = "Art Infinity Radio";
 
@@ -56,7 +61,12 @@ pub fn listports() -> Result<Vec<String>, String> {
     Ok(ports)
 }
 
-pub fn record(output_dir: &String, port_selection: Vec<String>, verbose: bool, should_stop: Arc<AtomicBool>) {
+pub fn record(
+    output_dir: &String,
+    port_selection: Vec<String>,
+    verbose: bool,
+    should_stop: Arc<AtomicBool>,
+) {
     let mut ports_to_record: Vec<String> = Vec::new();
 
     // create JACK client
@@ -205,6 +215,12 @@ pub fn record(output_dir: &String, port_selection: Vec<String>, verbose: bool, s
                 }
             }
             info!("Writer thread finished!");
+
+            info!("Creating a ZIP archive");
+            match compress_files_in_directory(output_dir) {
+                Ok(()) => info!("Done"),
+                Err(error) => error!("Could not create ZIP archive: {}", error),
+            }
         });
     }
 
@@ -296,4 +312,39 @@ fn is_unsafe_char(x: char) -> bool {
         return false;
     }
     return true;
+}
+
+fn compress_files_in_directory(target_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let zip_options = FileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .unix_permissions(0o755);
+    let file = File::create(Path::new(&target_dir).join("bundle.zip"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let mut buffer = vec![0u8; 10 * 1024 * 1024];
+
+    let paths = fs::read_dir(target_dir.clone())?;
+    for path in paths {
+        // println!("Name: {:?}", path.unwrap().path());
+        let path = path.unwrap().path();
+        if path.to_str().unwrap().ends_with(".zip") {
+            continue;
+        }
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        match zip.start_file(filename, zip_options) {
+            Ok(_) => {
+                let mut input_file = File::open(path)?;
+                loop {
+                    let count_read = input_file.read(&mut buffer)?;
+                    if count_read == 0 {
+                        break;
+                    }
+
+                    zip.write(&buffer[0..count_read])?;
+                }
+            }
+            Err(err) => error!("Could not add {:?} to zip archive: {}", path, err),
+        };
+    }
+    zip.finish()?;
+    Ok(())
 }
